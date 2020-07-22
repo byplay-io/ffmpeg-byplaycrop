@@ -1,3 +1,27 @@
+FFmpeg 4.2.2 with byplay crop filter
+=============
+
+like crop but allows specifying sequences for x and y:
+
+```bash
+ffmpeg -i vid.mp4 \
+    -vf byplaycrop=w=700:h=600:bpl_x_seq=10_13_40_30:bpl_y_seq=103_105_110_130 \
+    cropped.mp4
+```
+
+Given that vid.mp4 has 4 frames, apply crop with width=700 and height=600:
+
+Frame 1: x=10, y=103
+
+Frame 2: x=13, y=105
+
+Frame 3: x=40, y=110
+
+Frame 3: x=30, y=130
+
+Used internally at [byplay](https://byplay.io) to stabilize videos on cloud servers. Not distributed as a binary to users.
+
+
 FFmpeg README
 =============
 
