@@ -180,6 +180,7 @@ extern AVFilter ff_vf_copy;
 extern AVFilter ff_vf_coreimage;
 extern AVFilter ff_vf_cover_rect;
 extern AVFilter ff_vf_crop;
+extern AVFilter ff_vf_byplaycrop;
 extern AVFilter ff_vf_cropdetect;
 extern AVFilter ff_vf_cue;
 extern AVFilter ff_vf_curves;

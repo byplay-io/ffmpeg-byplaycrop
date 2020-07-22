@@ -192,6 +192,7 @@ OBJS-$(CONFIG_CONVOLVE_FILTER)               += vf_convolve.o framesync.o
 OBJS-$(CONFIG_COPY_FILTER)                   += vf_copy.o
 OBJS-$(CONFIG_COREIMAGE_FILTER)              += vf_coreimage.o
 OBJS-$(CONFIG_COVER_RECT_FILTER)             += vf_cover_rect.o lavfutils.o
+OBJS-$(CONFIG_BYPLAYCROP_FILTER)             += vf_byplaycrop.o
 OBJS-$(CONFIG_CROP_FILTER)                   += vf_crop.o
 OBJS-$(CONFIG_CROPDETECT_FILTER)             += vf_cropdetect.o
 OBJS-$(CONFIG_CUE_FILTER)                    += f_cue.o

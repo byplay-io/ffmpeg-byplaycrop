@@ -1,0 +1,490 @@
+/*
+ * Copyright (c) 2007 Bobby Bingham
+ *
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+/**
+ * @file
+ * video crop filter
+ */
+
+#include <stdio.h>
+
+#include "avfilter.h"
+#include "formats.h"
+#include "internal.h"
+#include "video.h"
+#include "libavutil/eval.h"
+#include "libavutil/avstring.h"
+#include "libavutil/internal.h"
+#include "libavutil/libm.h"
+#include "libavutil/imgutils.h"
+#include "libavutil/mathematics.h"
+#include "libavutil/opt.h"
+
+
+#define BPL_SEQ_SEP_CHAR '_'
+
+static const char *const var_names[] = {
+    "in_w", "iw",   ///< width  of the input video
+    "in_h", "ih",   ///< height of the input video
+    "out_w", "ow",  ///< width  of the cropped video
+    "out_h", "oh",  ///< height of the cropped video
+    "a",
+    "sar",
+    "dar",
+    "hsub",
+    "vsub",
+    "x",
+    "y",
+    "n",            ///< number of frame
+    "pos",          ///< position in the file
+    "t",            ///< timestamp expressed in seconds
+    "bpl_x_seq",
+    "bpl_y_seq",
+    NULL
+};
+
+enum var_name {
+    VAR_IN_W,  VAR_IW,
+    VAR_IN_H,  VAR_IH,
+    VAR_OUT_W, VAR_OW,
+    VAR_OUT_H, VAR_OH,
+    VAR_A,
+    VAR_SAR,
+    VAR_DAR,
+    VAR_HSUB,
+    VAR_VSUB,
+    VAR_X,
+    VAR_Y,
+    VAR_N,
+    VAR_POS,
+    VAR_T,
+    VAR_BPL_X_SEQ,
+    VAR_BPL_Y_SEQ,
+    VAR_VARS_NB
+};
+
+typedef struct CropContext {
+    const AVClass *class;
+    int  x;             ///< x offset of the non-cropped area with respect to the input area
+    int  y;             ///< y offset of the non-cropped area with respect to the input area
+    int  w;             ///< width of the cropped area
+    int  h;             ///< height of the cropped area
+
+    AVRational out_sar; ///< output sample aspect ratio
+    int keep_aspect;    ///< keep display aspect ratio when cropping
+    int exact;          ///< exact cropping, for subsampled formats
+
+    int max_step[4];    ///< max pixel step for each plane, expressed as a number of bytes
+    int hsub, vsub;     ///< chroma subsampling
+    char *x_expr, *y_expr, *w_expr, *h_expr;
+    char *bpl_x_seq_expr, *bpl_y_seq_expr;
+    AVExpr *x_pexpr, *y_pexpr;  /* parsed expressions for x and y */
+    double var_values[VAR_VARS_NB];
+
+    int* bpl_x_seq;
+    int* bpl_y_seq;
+} CropContext;
+
+static int count_bpl_seq(char* seq)
+{
+    int n = 0;
+    for(int i = 0; i < strlen(seq); i++)
+    {
+        if(seq[i] == BPL_SEQ_SEP_CHAR)
+        {
+            ++n;
+        }
+    }
+
+    return n + 1;
+}
+
+static int* parse_bpl_seq(char* seq, int n)
+{
+    int* res_seq = malloc(n * sizeof(int));
+
+    char buf[128];
+
+    int curr_buf_len = 0;
+    int curr_seq_num = 0;
+    for(int i = 0; i < strlen(seq); i++)
+    {
+        if(seq[i] == BPL_SEQ_SEP_CHAR)
+        {
+            buf[curr_buf_len] = 0;
+            res_seq[curr_seq_num++] = atoi(buf);
+            printf("Adding %s\n", buf);
+            curr_buf_len = 0;
+        }
+        else
+        {
+            buf[curr_buf_len] = seq[i];
+            curr_buf_len++;
+        }
+    }
+    buf[curr_buf_len] = 0;
+    res_seq[curr_seq_num] = atoi(buf);
+
+    return res_seq;
+}
+
+static int query_formats(AVFilterContext *ctx)
+{
+    AVFilterFormats *formats = NULL;
+    int fmt, ret;
+
+    for (fmt = 0; av_pix_fmt_desc_get(fmt); fmt++) {
+        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
+        if (desc->flags & AV_PIX_FMT_FLAG_BITSTREAM)
+            continue;
+        if (!(desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+            // Not usable if there is any subsampling but the format is
+            // not planar (e.g. YUYV422).
+            if ((desc->log2_chroma_w || desc->log2_chroma_h) &&
+                !(desc->flags & AV_PIX_FMT_FLAG_PLANAR))
+                continue;
+        }
+        ret = ff_add_format(&formats, fmt);
+        if (ret < 0)
+            return ret;
+    }
+
+    return ff_set_common_formats(ctx, formats);
+}
+
+static av_cold void uninit(AVFilterContext *ctx)
+{
+    CropContext *s = ctx->priv;
+
+    av_expr_free(s->x_pexpr);
+    s->x_pexpr = NULL;
+    av_expr_free(s->y_pexpr);
+    s->y_pexpr = NULL;
+}
+
+static inline int normalize_double(int *n, double d)
+{
+    int ret = 0;
+
+    if (isnan(d)) {
+        ret = AVERROR(EINVAL);
+    } else if (d > INT_MAX || d < INT_MIN) {
+        *n = d > INT_MAX ? INT_MAX : INT_MIN;
+        ret = AVERROR(EINVAL);
+    } else
+        *n = lrint(d);
+
+    return ret;
+}
+
+static int config_input(AVFilterLink *link)
+{
+    AVFilterContext *ctx = link->dst;
+    CropContext *s = ctx->priv;
+    const AVPixFmtDescriptor *pix_desc = av_pix_fmt_desc_get(link->format);
+    int ret;
+    const char *expr;
+    double res;
+
+    s->var_values[VAR_IN_W]  = s->var_values[VAR_IW] = ctx->inputs[0]->w;
+    s->var_values[VAR_IN_H]  = s->var_values[VAR_IH] = ctx->inputs[0]->h;
+    s->var_values[VAR_A]     = (float) link->w / link->h;
+    s->var_values[VAR_SAR]   = link->sample_aspect_ratio.num ? av_q2d(link->sample_aspect_ratio) : 1;
+    s->var_values[VAR_DAR]   = s->var_values[VAR_A] * s->var_values[VAR_SAR];
+    s->var_values[VAR_HSUB]  = 1<<pix_desc->log2_chroma_w;
+    s->var_values[VAR_VSUB]  = 1<<pix_desc->log2_chroma_h;
+    s->var_values[VAR_X]     = NAN;
+    s->var_values[VAR_Y]     = NAN;
+    s->var_values[VAR_OUT_W] = s->var_values[VAR_OW] = NAN;
+    s->var_values[VAR_OUT_H] = s->var_values[VAR_OH] = NAN;
+    s->var_values[VAR_N]     = 0;
+    s->var_values[VAR_T]     = NAN;
+    s->var_values[VAR_POS]   = NAN;
+
+    av_image_fill_max_pixsteps(s->max_step, NULL, pix_desc);
+
+    if (pix_desc->flags & AV_PIX_FMT_FLAG_HWACCEL) {
+        s->hsub = 1;
+        s->vsub = 1;
+    } else {
+        s->hsub = pix_desc->log2_chroma_w;
+        s->vsub = pix_desc->log2_chroma_h;
+    }
+
+    if ((ret = av_expr_parse_and_eval(&res, (expr = s->w_expr),
+                                      var_names, s->var_values,
+                                      NULL, NULL, NULL, NULL, NULL, 0, ctx)) < 0)
+        goto fail_expr;
+    s->var_values[VAR_OUT_W] = s->var_values[VAR_OW] = res;
+    if ((ret = av_expr_parse_and_eval(&res, (expr = s->h_expr),
+                                      var_names, s->var_values,
+                                      NULL, NULL, NULL, NULL, NULL, 0, ctx)) < 0)
+        goto fail_expr;
+    s->var_values[VAR_OUT_H] = s->var_values[VAR_OH] = res;
+    /* evaluate again ow as it may depend on oh */
+    if ((ret = av_expr_parse_and_eval(&res, (expr = s->w_expr),
+                                      var_names, s->var_values,
+                                      NULL, NULL, NULL, NULL, NULL, 0, ctx)) < 0)
+        goto fail_expr;
+
+    s->var_values[VAR_OUT_W] = s->var_values[VAR_OW] = res;
+    if (normalize_double(&s->w, s->var_values[VAR_OUT_W]) < 0 ||
+        normalize_double(&s->h, s->var_values[VAR_OUT_H]) < 0) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Too big value or invalid expression for out_w/ow or out_h/oh. "
+               "Maybe the expression for out_w:'%s' or for out_h:'%s' is self-referencing.\n",
+               s->w_expr, s->h_expr);
+        return AVERROR(EINVAL);
+    }
+
+    if (!s->exact) {
+        s->w &= ~((1 << s->hsub) - 1);
+        s->h &= ~((1 << s->vsub) - 1);
+    }
+
+    av_expr_free(s->x_pexpr);
+    av_expr_free(s->y_pexpr);
+    s->x_pexpr = s->y_pexpr = NULL;
+    if ((ret = av_expr_parse(&s->x_pexpr, s->x_expr, var_names,
+                             NULL, NULL, NULL, NULL, 0, ctx)) < 0 ||
+        (ret = av_expr_parse(&s->y_pexpr, s->y_expr, var_names,
+                             NULL, NULL, NULL, NULL, 0, ctx)) < 0)
+        return AVERROR(EINVAL);
+
+    int bpl_seq_size_x = count_bpl_seq(s->bpl_x_seq_expr);
+    int bpl_seq_size_y = count_bpl_seq(s->bpl_y_seq_expr);
+    if(bpl_seq_size_x != bpl_seq_size_y) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Lengths of bpl seqs on x and y don't match: %i != %i",
+        bpl_seq_size_x, bpl_seq_size_y);
+        return AVERROR(EINVAL);
+    }
+
+    s->bpl_x_seq = parse_bpl_seq(s->bpl_x_seq_expr, bpl_seq_size_x);
+    s->bpl_y_seq = parse_bpl_seq(s->bpl_y_seq_expr, bpl_seq_size_y);
+    av_log(ctx, AV_LOG_INFO, "Got bpl sequences of length %i\n", bpl_seq_size_x);
+
+    if (s->keep_aspect) {
+        AVRational dar = av_mul_q(link->sample_aspect_ratio,
+                                  (AVRational){ link->w, link->h });
+        av_reduce(&s->out_sar.num, &s->out_sar.den,
+                  dar.num * s->h, dar.den * s->w, INT_MAX);
+    } else
+        s->out_sar = link->sample_aspect_ratio;
+
+    av_log(ctx, AV_LOG_VERBOSE, "w:%d h:%d sar:%d/%d -> w:%d h:%d sar:%d/%d\n",
+           link->w, link->h, link->sample_aspect_ratio.num, link->sample_aspect_ratio.den,
+           s->w, s->h, s->out_sar.num, s->out_sar.den);
+
+    if (s->w <= 0 || s->h <= 0 ||
+        s->w > link->w || s->h > link->h) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Invalid too big or non positive size for width '%d' or height '%d'\n",
+               s->w, s->h);
+        return AVERROR(EINVAL);
+    }
+
+    /* set default, required in the case the first computed value for x/y is NAN */
+    s->x = (link->w - s->w) / 2;
+    s->y = (link->h - s->h) / 2;
+    if (!s->exact) {
+        s->x &= ~((1 << s->hsub) - 1);
+        s->y &= ~((1 << s->vsub) - 1);
+    }
+    return 0;
+
+fail_expr:
+    av_log(NULL, AV_LOG_ERROR, "Error when evaluating the expression '%s'\n", expr);
+    return ret;
+}
+
+static int config_output(AVFilterLink *link)
+{
+    CropContext *s = link->src->priv;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(link->format);
+
+    if (desc->flags & AV_PIX_FMT_FLAG_HWACCEL) {
+        // Hardware frames adjust the cropping regions rather than
+        // changing the frame size.
+    } else {
+        link->w = s->w;
+        link->h = s->h;
+    }
+    link->sample_aspect_ratio = s->out_sar;
+
+    return 0;
+}
+
+static int filter_frame(AVFilterLink *link, AVFrame *frame)
+{
+    AVFilterContext *ctx = link->dst;
+    CropContext *s = ctx->priv;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(link->format);
+    int i;
+
+    s->var_values[VAR_N] = link->frame_count_out;
+    s->var_values[VAR_T] = frame->pts == AV_NOPTS_VALUE ?
+        NAN : frame->pts * av_q2d(link->time_base);
+    s->var_values[VAR_POS] = frame->pkt_pos == -1 ?
+        NAN : frame->pkt_pos;
+
+    int frame_ind = link->frame_count_out - 1;
+
+    s->x = s->bpl_x_seq[frame_ind];
+    s->y = s->bpl_y_seq[frame_ind];
+
+    normalize_double(&s->x, s->var_values[VAR_X]);
+    normalize_double(&s->y, s->var_values[VAR_Y]);
+
+//    if (s->x < 0)
+//        s->x = 0;
+//    if (s->y < 0)
+//        s->y = 0;
+//    if ((unsigned)s->x + (unsigned)s->w > link->w)
+//        s->x = link->w - s->w;
+//    if ((unsigned)s->y + (unsigned)s->h > link->h)
+//        s->y = link->h - s->h;
+//    if (!s->exact) {
+//        s->x &= ~((1 << s->hsub) - 1);
+//        s->y &= ~((1 << s->vsub) - 1);
+//    }
+
+    av_log(ctx, AV_LOG_INFO, "n:%d t:%f pos:%f x:%d y:%d x+w:%d y+h:%d\n",
+            (int)s->var_values[VAR_N], s->var_values[VAR_T], s->var_values[VAR_POS],
+            s->x, s->y, s->x+s->w, s->y+s->h);
+
+    if (desc->flags & AV_PIX_FMT_FLAG_HWACCEL) {
+        frame->crop_top   += s->y;
+        frame->crop_left  += s->x;
+        frame->crop_bottom = frame->height - frame->crop_top - frame->crop_bottom - s->h;
+        frame->crop_right  = frame->width  - frame->crop_left - frame->crop_right - s->w;
+    } else {
+        frame->width  = s->w;
+        frame->height = s->h;
+
+        frame->data[0] += s->y * frame->linesize[0];
+        frame->data[0] += s->x * s->max_step[0];
+
+        if (!(desc->flags & AV_PIX_FMT_FLAG_PAL || desc->flags & FF_PSEUDOPAL)) {
+            for (i = 1; i < 3; i ++) {
+                if (frame->data[i]) {
+                    frame->data[i] += (s->y >> s->vsub) * frame->linesize[i];
+                    frame->data[i] += (s->x * s->max_step[i]) >> s->hsub;
+                }
+            }
+        }
+
+        /* alpha plane */
+        if (frame->data[3]) {
+            frame->data[3] += s->y * frame->linesize[3];
+            frame->data[3] += s->x * s->max_step[3];
+        }
+    }
+
+    return ff_filter_frame(link->dst->outputs[0], frame);
+}
+
+static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
+                           char *res, int res_len, int flags)
+{
+    CropContext *s = ctx->priv;
+    int ret;
+
+    if (   !strcmp(cmd, "out_w")  || !strcmp(cmd, "w")
+        || !strcmp(cmd, "out_h")  || !strcmp(cmd, "h")
+        || !strcmp(cmd, "x")      || !strcmp(cmd, "y")
+        || !strcmp(cmd, "bpl_x_seq") || !strcmp(cmd, "bpl_x_seq")
+        ) {
+
+        int old_x = s->x;
+        int old_y = s->y;
+        int old_w = s->w;
+        int old_h = s->h;
+
+        AVFilterLink *outlink = ctx->outputs[0];
+        AVFilterLink *inlink  = ctx->inputs[0];
+
+        av_opt_set(s, cmd, args, 0);
+
+        if ((ret = config_input(inlink)) < 0) {
+            s->x = old_x;
+            s->y = old_y;
+            s->w = old_w;
+            s->h = old_h;
+            return ret;
+        }
+
+        ret = config_output(outlink);
+
+    } else
+        ret = AVERROR(ENOSYS);
+
+    return ret;
+}
+
+#define OFFSET(x) offsetof(CropContext, x)
+#define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
+
+static const AVOption crop_options[] = {
+    { "out_w",       "set the width crop area expression",   OFFSET(w_expr), AV_OPT_TYPE_STRING, {.str = "iw"}, CHAR_MIN, CHAR_MAX, FLAGS },
+    { "w",           "set the width crop area expression",   OFFSET(w_expr), AV_OPT_TYPE_STRING, {.str = "iw"}, CHAR_MIN, CHAR_MAX, FLAGS },
+    { "out_h",       "set the height crop area expression",  OFFSET(h_expr), AV_OPT_TYPE_STRING, {.str = "ih"}, CHAR_MIN, CHAR_MAX, FLAGS },
+    { "h",           "set the height crop area expression",  OFFSET(h_expr), AV_OPT_TYPE_STRING, {.str = "ih"}, CHAR_MIN, CHAR_MAX, FLAGS },
+    { "x",           "set the x crop area expression",       OFFSET(x_expr), AV_OPT_TYPE_STRING, {.str = "(in_w-out_w)/2"}, CHAR_MIN, CHAR_MAX, FLAGS },
+    { "y",           "set the y crop area expression",       OFFSET(y_expr), AV_OPT_TYPE_STRING, {.str = "(in_h-out_h)/2"}, CHAR_MIN, CHAR_MAX, FLAGS },
+    { "bpl_x_seq",   "set the x crop sequence",              OFFSET(bpl_x_seq_expr), AV_OPT_TYPE_STRING, {.str = "0"}, CHAR_MIN, CHAR_MAX, FLAGS },
+    { "bpl_y_seq",   "set the y crop sequence",              OFFSET(bpl_y_seq_expr), AV_OPT_TYPE_STRING, {.str = "0"}, CHAR_MIN, CHAR_MAX, FLAGS },
+    { "keep_aspect", "keep aspect ratio",                    OFFSET(keep_aspect), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS },
+    { "exact",       "do exact cropping",                    OFFSET(exact),  AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS },
+    { NULL }
+};
+
+AVFILTER_DEFINE_CLASS(crop);
+
+static const AVFilterPad avfilter_vf_crop_inputs[] = {
+    {
+        .name         = "default",
+        .type         = AVMEDIA_TYPE_VIDEO,
+        .filter_frame = filter_frame,
+        .config_props = config_input,
+    },
+    { NULL }
+};
+
+static const AVFilterPad avfilter_vf_crop_outputs[] = {
+    {
+        .name         = "default",
+        .type         = AVMEDIA_TYPE_VIDEO,
+        .config_props = config_output,
+    },
+    { NULL }
+};
+
+AVFilter ff_vf_byplaycrop = {
+    .name            = "byplaycrop",
+    .description     = NULL_IF_CONFIG_SMALL("BYPLAY: Crop the input video with offset for each frame"),
+    .priv_size       = sizeof(CropContext),
+    .priv_class      = &crop_class,
+    .query_formats   = query_formats,
+    .uninit          = uninit,
+    .inputs          = avfilter_vf_crop_inputs,
+    .outputs         = avfilter_vf_crop_outputs,
+    .process_command = process_command,
+};
