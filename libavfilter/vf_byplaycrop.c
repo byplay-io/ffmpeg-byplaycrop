@@ -55,8 +55,6 @@ static const char *const var_names[] = {
     "n",            ///< number of frame
     "pos",          ///< position in the file
     "t",            ///< timestamp expressed in seconds
-    "bpl_x_seq",
-    "bpl_y_seq",
     NULL
 };
 
@@ -75,8 +73,6 @@ enum var_name {
     VAR_N,
     VAR_POS,
     VAR_T,
-    VAR_BPL_X_SEQ,
-    VAR_BPL_Y_SEQ,
     VAR_VARS_NB
 };
 
@@ -140,6 +136,7 @@ static int* parse_bpl_seq(char* seq, int n)
         }
     }
     buf[curr_buf_len] = 0;
+    printf("Adding %s\n", buf);
     res_seq[curr_seq_num] = atoi(buf);
 
     return res_seq;
@@ -346,6 +343,9 @@ static int filter_frame(AVFilterLink *link, AVFrame *frame)
         NAN : frame->pkt_pos;
 
     int frame_ind = link->frame_count_out - 1;
+    if(link->frame_count_out == 0) {
+        frame_ind = link->frame_count_out;
+    }
 
     s->x = s->bpl_x_seq[frame_ind];
     s->y = s->bpl_y_seq[frame_ind];
@@ -353,18 +353,18 @@ static int filter_frame(AVFilterLink *link, AVFrame *frame)
     normalize_double(&s->x, s->var_values[VAR_X]);
     normalize_double(&s->y, s->var_values[VAR_Y]);
 
-//    if (s->x < 0)
-//        s->x = 0;
-//    if (s->y < 0)
-//        s->y = 0;
-//    if ((unsigned)s->x + (unsigned)s->w > link->w)
-//        s->x = link->w - s->w;
-//    if ((unsigned)s->y + (unsigned)s->h > link->h)
-//        s->y = link->h - s->h;
-//    if (!s->exact) {
-//        s->x &= ~((1 << s->hsub) - 1);
-//        s->y &= ~((1 << s->vsub) - 1);
-//    }
+    if (s->x < 0)
+        s->x = 0;
+    if (s->y < 0)
+        s->y = 0;
+    if ((unsigned)s->x + (unsigned)s->w > link->w)
+        s->x = link->w - s->w;
+    if ((unsigned)s->y + (unsigned)s->h > link->h)
+        s->y = link->h - s->h;
+    if (!s->exact) {
+        s->x &= ~((1 << s->hsub) - 1);
+        s->y &= ~((1 << s->vsub) - 1);
+    }
 
     av_log(ctx, AV_LOG_INFO, "n:%d t:%f pos:%f x:%d y:%d x+w:%d y+h:%d\n",
             (int)s->var_values[VAR_N], s->var_values[VAR_T], s->var_values[VAR_POS],
