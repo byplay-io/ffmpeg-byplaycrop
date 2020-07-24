@@ -126,7 +126,6 @@ static int* parse_bpl_seq(char* seq, int n)
         {
             buf[curr_buf_len] = 0;
             res_seq[curr_seq_num++] = atoi(buf);
-            printf("Adding %s\n", buf);
             curr_buf_len = 0;
         }
         else
@@ -136,7 +135,6 @@ static int* parse_bpl_seq(char* seq, int n)
         }
     }
     buf[curr_buf_len] = 0;
-    printf("Adding %s\n", buf);
     res_seq[curr_seq_num] = atoi(buf);
 
     return res_seq;
@@ -276,7 +274,7 @@ static int config_input(AVFilterLink *link)
 
     s->bpl_x_seq = parse_bpl_seq(s->bpl_x_seq_expr, bpl_seq_size_x);
     s->bpl_y_seq = parse_bpl_seq(s->bpl_y_seq_expr, bpl_seq_size_y);
-    av_log(ctx, AV_LOG_INFO, "Got bpl sequences of length %i\n", bpl_seq_size_x);
+    av_log(ctx, AV_LOG_TRACE, "Got bpl sequences of length %i\n", bpl_seq_size_x);
 
     if (s->keep_aspect) {
         AVRational dar = av_mul_q(link->sample_aspect_ratio,
@@ -366,7 +364,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *frame)
         s->y &= ~((1 << s->vsub) - 1);
     }
 
-    av_log(ctx, AV_LOG_INFO, "n:%d t:%f pos:%f x:%d y:%d x+w:%d y+h:%d\n",
+    av_log(ctx, AV_LOG_TRACE, "n:%d t:%f pos:%f x:%d y:%d x+w:%d y+h:%d\n",
             (int)s->var_values[VAR_N], s->var_values[VAR_T], s->var_values[VAR_POS],
             s->x, s->y, s->x+s->w, s->y+s->h);
 
